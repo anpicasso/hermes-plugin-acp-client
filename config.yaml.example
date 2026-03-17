@@ -1,0 +1,11 @@
+# ACP Client Plugin Configuration
+
+# Path to the OpenCode binary
+opencode_binary: ~/.opencode/bin/opencode
+
+# Default workspace directory for new sessions
+default_cwd: ~/omo
+
+# Auto-approve all permission requests from the agent
+# (recommended for autonomous operation)
+auto_approve: true
