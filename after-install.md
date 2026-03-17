@@ -19,7 +19,7 @@ Connects Hermes to ACP agents (OpenCode) via stdio.
 | Tool | What it does |
 |------|-------------|
 | `acp_agents` | Discover available agents/modes |
-| `acp_send` | Send prompts to agents (sisyphus, prometheus, etc.) |
+| `acp_send` | Send prompts to agents |
 | `acp_sessions` | List active sessions |
 
 Permissions are auto-approved for autonomous operation.

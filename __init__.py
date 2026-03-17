@@ -697,9 +697,8 @@ ACP_AGENTS_SCHEMA = {
     "description": (
         "Discover available agents/modes from an ACP server (OpenCode). "
         "Returns agent names, descriptions, available models, and a pre-created "
-        "session_id you can reuse with acp_send. Call this to see what agents "
-        "are available (e.g. sisyphus, prometheus, hephaestus, code) before "
-        "sending prompts."
+        "session_id you can reuse with acp_send. Call this first to see what "
+        "agents are configured before sending prompts."
     ),
     "parameters": {
         "type": "object",
@@ -719,11 +718,11 @@ ACP_AGENTS_SCHEMA = {
 ACP_SEND_SCHEMA = {
     "name": "acp_send",
     "description": (
-        "Send a prompt to an ACP agent (e.g. OpenCode's sisyphus, prometheus, "
-        "hephaestus, atlas, code) and get the response. The agent can autonomously "
-        "read/write files, run terminal commands, and use tools in the workspace. "
-        "Returns the agent's text response, tool call summary, execution plan, "
-        "and token usage. Use session_id to continue multi-turn conversations."
+        "Send a prompt to an ACP agent and get the response. The agent can "
+        "autonomously read/write files, run terminal commands, and use tools "
+        "in the workspace. Returns the agent's text response, tool call summary, "
+        "execution plan, and token usage. Use acp_agents first to discover "
+        "available agents. Use session_id to continue multi-turn conversations."
     ),
     "parameters": {
         "type": "object",
@@ -735,8 +734,7 @@ ACP_SEND_SCHEMA = {
             "agent": {
                 "type": "string",
                 "description": (
-                    "Agent/mode name (e.g. 'sisyphus', 'prometheus', 'code'). "
-                    "Use acp_agents to discover available agents. "
+                    "Agent/mode name as returned by acp_agents. "
                     "Omit for the workspace's default agent."
                 ),
             },

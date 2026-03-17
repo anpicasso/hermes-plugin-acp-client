@@ -4,7 +4,7 @@ Connect Hermes to [ACP (Agent Client Protocol)](https://agentclientprotocol.com/
 
 ## What it does
 
-Spawns `opencode acp` as a subprocess and communicates via NDJSON (JSON-RPC 2.0 over stdio). This gives Hermes access to all configured OpenCode agents — coding, planning, exploring, and specialized workers — as native tools.
+Spawns `opencode acp` as a subprocess and communicates via NDJSON (JSON-RPC 2.0 over stdio). This gives Hermes access to all agents/modes configured in OpenCode as native tools — the plugin discovers them automatically.
 
 ## Tools
 
@@ -74,17 +74,7 @@ acp_send(prompt="Add rate limiting to the auth endpoints", session_id="ses_abc12
 
 ## Available agents
 
-Agents depend on your OpenCode/oh-my-opencode configuration. Common examples:
-
-| Agent | Role |
-|-------|------|
-| **sisyphus** | Main orchestrator — plans, delegates, drives tasks |
-| **prometheus** | Strategic planner (read-only) |
-| **hephaestus** | Deep autonomous worker |
-| **atlas** | Plan executor/conductor |
-| **code** | Default coding mode |
-
-Use `acp_agents` to discover what's configured in your workspace.
+Agents depend entirely on your OpenCode configuration. Use `acp_agents` to discover what's available in your workspace — the plugin is agent-agnostic and surfaces whatever modes OpenCode exposes.
 
 ## Requirements
 
