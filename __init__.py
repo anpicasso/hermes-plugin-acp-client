@@ -112,12 +112,11 @@ class ACPClient:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            bufsize=0,
         )
 
+        self._alive = True  # must be set BEFORE reader starts
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
-        self._alive = True
 
         resp = self._request("initialize", {
             "protocolVersion": 1,
