@@ -3,8 +3,12 @@ ACP Client Plugin (stdio transport)
 ====================================
 
 Connects Hermes to agents running ACP (Agent Client Protocol) servers
-over stdio — primarily OpenCode. Spawns ``opencode acp`` as a subprocess,
-communicates via NDJSON (newline-delimited JSON-RPC 2.0).
+over stdio. Supports multiple providers:
+
+  - **opencode** — spawns ``opencode acp``
+  - **codex** — spawns ``npx @zed-industries/codex-acp``
+
+All providers speak the same NDJSON (JSON-RPC 2.0) protocol.
 
 Tools provided:
   acp_agents   — discover available agents/modes
@@ -17,12 +21,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import yaml
@@ -57,6 +62,55 @@ def _load_config(reload: bool = False) -> Dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Provider definitions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _resolve_provider(name: str) -> Tuple[List[str], str]:
+    """Return (command, display_name) for a provider, or raise on failure.
+
+    Validates that the required binary/package is available before returning.
+    """
+    cfg = _load_config()
+    providers_cfg = cfg.get("providers", {})
+    provider_cfg = providers_cfg.get(name, {})
+
+    if name == "opencode":
+        binary = provider_cfg.get("binary", cfg.get("opencode_binary", "~/.opencode/bin/opencode"))
+        binary = os.path.expanduser(binary)
+        if not os.path.isfile(binary):
+            raise FileNotFoundError(
+                f"OpenCode binary not found at '{binary}'. "
+                f"Install OpenCode or set providers.opencode.binary in config.yaml"
+            )
+        return [binary, "acp"], "OpenCode"
+
+    elif name == "codex":
+        npx = provider_cfg.get("npx", "npx")
+        npx_path = shutil.which(npx)
+        if not npx_path:
+            # Try common locations not always in PATH
+            for candidate in [
+                "/home/linuxbrew/.linuxbrew/bin/npx",
+                "/usr/local/bin/npx",
+                os.path.expanduser("~/.nvm/current/bin/npx"),
+            ]:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    npx_path = candidate
+                    break
+        if not npx_path:
+            raise FileNotFoundError(
+                f"npx not found in PATH. Install Node.js/npm to use the codex provider."
+            )
+        package = provider_cfg.get("package", "@zed-industries/codex-acp")
+        return [npx_path, package], "Codex"
+
+    else:
+        raise ValueError(
+            f"Unknown ACP provider: '{name}'. Available: opencode, codex"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  ACP Client — stdio NDJSON transport
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -64,10 +118,12 @@ def _load_config(reload: bool = False) -> Dict[str, Any]:
 class ACPClient:
     """Manage an ACP server subprocess with bidirectional JSON-RPC 2.0."""
 
-    def __init__(self, binary: str, default_cwd: str, auto_approve: bool = True):
-        self.binary = os.path.expanduser(binary)
+    def __init__(self, cmd: List[str], default_cwd: str, auto_approve: bool = True,
+                 provider_name: str = "opencode"):
+        self.cmd = cmd
         self.default_cwd = os.path.expanduser(default_cwd)
         self.auto_approve = auto_approve
+        self.provider_name = provider_name
         self.process: Optional[subprocess.Popen] = None
 
         # JSON-RPC bookkeeping
@@ -97,18 +153,19 @@ class ACPClient:
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     def start(self) -> dict:
-        """Spawn opencode acp and perform the initialize handshake."""
+        """Spawn the ACP subprocess and perform the initialize handshake."""
         if self._alive:
             return {"already_started": True}
 
-        if not os.path.isfile(self.binary):
-            raise FileNotFoundError(f"OpenCode binary not found: {self.binary}")
+        # Build launch command — opencode needs --cwd, codex uses config
+        launch_cmd = list(self.cmd)
+        if self.provider_name == "opencode":
+            launch_cmd.extend(["--cwd", self.default_cwd])
 
-        cmd = [self.binary, "acp", "--cwd", self.default_cwd]
-        logger.info("Starting ACP subprocess: %s", " ".join(cmd))
+        logger.info("Starting ACP subprocess: %s", " ".join(launch_cmd))
 
         self.process = subprocess.Popen(
-            cmd,
+            launch_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -461,30 +518,41 @@ class ACPClient:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Singleton client
+#  Client pool — one per provider
 # ═══════════════════════════════════════════════════════════════════════════
 
-_client: Optional[ACPClient] = None
-_client_lock = threading.Lock()
+_clients: Dict[str, ACPClient] = {}
+_clients_lock = threading.Lock()
 
 
-def _get_client() -> ACPClient:
-    """Get or create the singleton ACP client."""
-    global _client
-    with _client_lock:
-        if _client and _client.is_alive:
-            return _client
-        if _client:
-            _client.stop()
+def _get_client(provider: str = None) -> ACPClient:
+    """Get or create the client for a given provider."""
+    cfg = _load_config(reload=True)
 
-        cfg = _load_config(reload=True)
-        binary = cfg.get("opencode_binary", "~/.opencode/bin/opencode")
+    if not provider:
+        provider = cfg.get("default_provider", "opencode")
+
+    with _clients_lock:
+        existing = _clients.get(provider)
+        if existing and existing.is_alive:
+            return existing
+        if existing:
+            existing.stop()
+
+        cmd, display = _resolve_provider(provider)
         cwd = cfg.get("default_cwd", "~")
         auto = cfg.get("auto_approve", True)
 
-        _client = ACPClient(binary, cwd, auto)
-        _client.start()
-        return _client
+        # Per-provider cwd override
+        providers_cfg = cfg.get("providers", {})
+        pcfg = providers_cfg.get(provider, {})
+        if pcfg.get("default_cwd"):
+            cwd = pcfg["default_cwd"]
+
+        client = ACPClient(cmd, cwd, auto, provider_name=provider)
+        client.start()
+        _clients[provider] = client
+        return client
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -579,7 +647,8 @@ def _assemble(raw: dict) -> dict:
 def handle_acp_agents(args: Dict[str, Any], **kwargs) -> str:
     """Discover available agents/modes from the ACP server."""
     try:
-        client = _get_client()
+        provider = args.get("provider", "")
+        client = _get_client(provider or None)
         cwd = args.get("cwd") or client.default_cwd
         resp = client.new_session(cwd=cwd)
 
@@ -599,6 +668,8 @@ def handle_acp_agents(args: Dict[str, Any], **kwargs) -> str:
             })
 
         return json.dumps({
+            "provider": client.provider_name,
+            "agent_info": client.agent_info,
             "agents": agents,
             "current_agent": modes.get("currentModeId", ""),
             "current_model": models.get("currentModelId", ""),
@@ -621,7 +692,8 @@ def handle_acp_send(args: Dict[str, Any], **kwargs) -> str:
         return json.dumps({"error": "prompt is required"})
 
     try:
-        client = _get_client()
+        provider = args.get("provider", "")
+        client = _get_client(provider or None)
         cwd = args.get("cwd") or client.default_cwd
         agent = args.get("agent", "")
         session_id = args.get("session_id", "")
@@ -652,6 +724,7 @@ def handle_acp_send(args: Dict[str, Any], **kwargs) -> str:
         # Send the prompt
         raw = client.prompt(session_id, prompt_text, timeout=timeout)
         assembled = _assemble(raw)
+        assembled["provider"] = client.provider_name
         assembled["session_id"] = session_id
         assembled["agent"] = agent or "default"
 
@@ -664,7 +737,8 @@ def handle_acp_send(args: Dict[str, Any], **kwargs) -> str:
 def handle_acp_sessions(args: Dict[str, Any], **kwargs) -> str:
     """List active ACP sessions."""
     try:
-        client = _get_client()
+        provider = args.get("provider", "")
+        client = _get_client(provider or None)
         cwd = args.get("cwd")
         resp = client.list_sessions(cwd=cwd)
 
@@ -673,6 +747,7 @@ def handle_acp_sessions(args: Dict[str, Any], **kwargs) -> str:
 
         sessions = resp.get("result", {}).get("sessions", [])
         return json.dumps({
+            "provider": client.provider_name,
             "sessions": [
                 {
                     "session_id": s.get("sessionId", ""),
@@ -692,10 +767,15 @@ def handle_acp_sessions(args: Dict[str, Any], **kwargs) -> str:
 #  Tool schemas
 # ═══════════════════════════════════════════════════════════════════════════
 
+_PROVIDER_DESC = (
+    "ACP provider to use: 'opencode' or 'codex'. "
+    "Defaults to config default_provider."
+)
+
 ACP_AGENTS_SCHEMA = {
     "name": "acp_agents",
     "description": (
-        "Discover available agents/modes from an ACP server (OpenCode). "
+        "Discover available agents/modes from an ACP server. "
         "Returns agent names, descriptions, available models, and a pre-created "
         "session_id you can reuse with acp_send. Call this first to see what "
         "agents are configured before sending prompts."
@@ -703,6 +783,10 @@ ACP_AGENTS_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "provider": {
+                "type": "string",
+                "description": _PROVIDER_DESC,
+            },
             "cwd": {
                 "type": "string",
                 "description": (
@@ -730,6 +814,10 @@ ACP_SEND_SCHEMA = {
             "prompt": {
                 "type": "string",
                 "description": "The message or task to send to the agent.",
+            },
+            "provider": {
+                "type": "string",
+                "description": _PROVIDER_DESC,
             },
             "agent": {
                 "type": "string",
@@ -771,6 +859,10 @@ ACP_SESSIONS_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "provider": {
+                "type": "string",
+                "description": _PROVIDER_DESC,
+            },
             "cwd": {
                 "type": "string",
                 "description": "Filter sessions by workspace directory.",
