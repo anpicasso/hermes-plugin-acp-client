@@ -36,6 +36,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+MAX_RESPONSE_CHARS = 120_000
+MAX_THOUGHT_CHARS = 12_000
+MAX_TERMINAL_BUFFER_BYTES = 262_144
+TRUNCATION_NOTICE = "… [truncated by ACP client safety limit]"
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Config
 # ═══════════════════════════════════════════════════════════════════════════
@@ -134,13 +139,14 @@ class ACPClient:
         self._resp_data: Dict[int, dict] = {}
         self._resp_lock = threading.Lock()  # Protects _resp_events and _resp_data
 
-        # Streaming update collectors (session_id → list of updates)
-        self._update_queues: Dict[str, List[dict]] = {}
+        # Streaming update collectors (session_id → bounded aggregate state)
+        self._update_queues: Dict[str, dict] = {}
         self._update_queues_lock = threading.Lock()  # Protects _update_queues
 
         # Terminal subprocess management
         self._terminals: Dict[str, subprocess.Popen] = {}
         self._term_bufs: Dict[str, bytearray] = {}
+        self._term_truncated: Dict[str, bool] = {}
         self._term_bufs_lock = threading.Lock()  # Protects _term_bufs
 
         self._reader: Optional[threading.Thread] = None
@@ -225,6 +231,7 @@ class ACPClient:
                 pass
         self._terminals.clear()
         self._term_bufs.clear()
+        self._term_truncated.clear()
 
     @property
     def is_alive(self) -> bool:
@@ -233,6 +240,119 @@ class ACPClient:
             and self.process is not None
             and self.process.poll() is None
         )
+
+    def _new_update_collector(self) -> dict:
+        return {
+            "response_parts": [],
+            "response_chars": 0,
+            "response_truncated": False,
+            "thought_parts": [],
+            "thought_chars": 0,
+            "thought_truncated": False,
+            "tool_calls": {},
+            "plan": [],
+            "usage": None,
+            "ignored_updates": 0,
+        }
+
+    def _append_bounded(self, collector: dict, parts_key: str, chars_key: str,
+                        truncated_key: str, text: str, max_chars: int):
+        if not text or collector.get(truncated_key):
+            return
+        current = collector.get(chars_key, 0)
+        remaining = max_chars - current
+        if remaining <= 0:
+            collector[truncated_key] = True
+            return
+        if len(text) <= remaining:
+            collector[parts_key].append(text)
+            collector[chars_key] = current + len(text)
+            return
+        collector[parts_key].append(text[:remaining])
+        collector[chars_key] = max_chars
+        collector[truncated_key] = True
+
+    def _record_update(self, session_id: str, upd: dict):
+        collector = self._update_queues.get(session_id)
+        if not collector:
+            return
+
+        kind = upd.get("sessionUpdate", "")
+
+        if kind == "agent_message_chunk":
+            content = upd.get("content", {})
+            if content.get("type") == "text":
+                self._append_bounded(
+                    collector,
+                    "response_parts",
+                    "response_chars",
+                    "response_truncated",
+                    content.get("text", ""),
+                    MAX_RESPONSE_CHARS,
+                )
+            return
+
+        if kind == "agent_thought_chunk":
+            content = upd.get("content", {})
+            if content.get("type") == "text":
+                self._append_bounded(
+                    collector,
+                    "thought_parts",
+                    "thought_chars",
+                    "thought_truncated",
+                    content.get("text", ""),
+                    MAX_THOUGHT_CHARS,
+                )
+            return
+
+        if kind == "tool_call":
+            tcid = upd.get("toolCallId", "")
+            if tcid:
+                collector["tool_calls"][tcid] = {
+                    "title": upd.get("title", ""),
+                    "kind": upd.get("kind", ""),
+                    "status": upd.get("status", ""),
+                }
+            return
+
+        if kind == "tool_call_update":
+            tcid = upd.get("toolCallId", "")
+            if not tcid:
+                return
+            tool_call = collector["tool_calls"].setdefault(tcid, {
+                "title": upd.get("title", ""),
+                "kind": upd.get("kind", ""),
+                "status": "",
+            })
+            if upd.get("status"):
+                tool_call["status"] = upd["status"]
+            if upd.get("title") and not tool_call.get("title"):
+                tool_call["title"] = upd["title"]
+            if upd.get("kind") and not tool_call.get("kind"):
+                tool_call["kind"] = upd["kind"]
+            return
+
+        if kind == "plan":
+            collector["plan"] = [
+                {"title": e.get("title", ""), "status": e.get("status", "")}
+                for e in upd.get("entries", [])
+            ]
+            return
+
+        if kind == "usage_update":
+            collector["usage"] = {k: v for k, v in upd.items() if k != "sessionUpdate"}
+            return
+
+        collector["ignored_updates"] = collector.get("ignored_updates", 0) + 1
+
+    def _drain_terminal_output(self, terminal_id: str) -> str:
+        with self._term_bufs_lock:
+            buf = self._term_bufs.pop(terminal_id, bytearray())
+            truncated = self._term_truncated.pop(terminal_id, False)
+        out = buf.decode("utf-8", errors="replace")
+        if truncated:
+            return f"[output truncated by ACP client safety limit: {MAX_TERMINAL_BUFFER_BYTES} bytes kept]\n{out}"
+        return out
 
     # ── Wire protocol ─────────────────────────────────────────────────
 
@@ -366,8 +486,7 @@ class ACPClient:
             sid = params.get("sessionId", "")
             upd = params.get("update", {})
             with self._update_queues_lock:
-                if sid in self._update_queues:
-                    self._update_queues[sid].append(upd)
+                self._record_update(sid, upd)
 
     # ── Agent → Client requests ───────────────────────────────────────
 
@@ -464,6 +583,7 @@ class ACPClient:
             )
             self._terminals[tid] = proc
             self._term_bufs[tid] = bytearray()
+            self._term_truncated[tid] = False
             # Background reader for terminal stdout
             threading.Thread(
                 target=self._term_reader, args=(tid,), daemon=True,
@@ -472,9 +592,10 @@ class ACPClient:
 
         elif op == "output":
             tid = params.get("terminalId", "")
+            out = self._drain_terminal_output(tid)
             with self._term_bufs_lock:
-                buf = self._term_bufs.pop(tid, bytearray())
-            out = buf.decode("utf-8", errors="replace")
+                self._term_bufs[tid] = bytearray()
+                self._term_truncated[tid] = False
             self._send({"jsonrpc": "2.0", "id": mid, "result": {"output": out}})
 
         elif op == "wait_for_exit":
@@ -492,8 +613,8 @@ class ACPClient:
                 proc.kill()
                 exit_code = -1
             time.sleep(0.1)  # let reader catch final output
-            with self._term_bufs_lock:
-                out = self._term_bufs.pop(tid, bytearray()).decode("utf-8", errors="replace")
+            out = self._drain_terminal_output(tid)
+            self._terminals.pop(tid, None)
             self._send({
                 "jsonrpc": "2.0", "id": mid,
                 "result": {"exitCode": exit_code, "output": out},
@@ -504,13 +625,14 @@ class ACPClient:
             proc = self._terminals.get(tid)
             if proc:
                 proc.kill()
+            self._terminals.pop(tid, None)
+            self._drain_terminal_output(tid)
             self._send({"jsonrpc": "2.0", "id": mid, "result": {}})
 
         elif op == "release":
             tid = params.get("terminalId", "")
             self._terminals.pop(tid, None)
-            with self._term_bufs_lock:
-                self._term_bufs.pop(tid, None)
+            self._drain_terminal_output(tid)
             self._send({"jsonrpc": "2.0", "id": mid, "result": {}})
 
         else:
@@ -530,7 +652,12 @@ class ACPClient:
                 break
             with self._term_bufs_lock:
                 if tid in self._term_bufs:
-                    self._term_bufs[tid].extend(chunk)
+                    buf = self._term_bufs[tid]
+                    remaining = MAX_TERMINAL_BUFFER_BYTES - len(buf)
+                    if remaining > 0:
+                        buf.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        self._term_truncated[tid] = True
 
     # ── High-level API ────────────────────────────────────────────────
 
@@ -544,11 +671,11 @@ class ACPClient:
     def prompt(self, session_id: str, text: str, timeout: int = 600) -> dict:
         """Send a prompt and collect all streaming updates.
 
-        Returns ``{"wire": <rpc response>, "updates": [<update dicts>]}``.
+        Returns ``{"wire": <rpc response>, "updates": <bounded collector>}``.
         On timeout, sends session/cancel and returns partial updates.
         """
         with self._update_queues_lock:
-            self._update_queues[session_id] = []
+            self._update_queues[session_id] = self._new_update_collector()
         try:
             result = self._request("session/prompt", {
                 "sessionId": session_id,
@@ -640,6 +767,45 @@ def _assemble(raw: dict) -> dict:
     """Turn raw prompt result + streaming updates into a clean response."""
     updates = raw.get("updates", [])
     wire = raw.get("wire", {})
+
+    if isinstance(updates, dict):
+        response = "".join(updates.get("response_parts", []))
+        if updates.get("response_truncated"):
+            response += TRUNCATION_NOTICE
+
+        result: Dict[str, Any] = {
+            "response": response,
+        }
+
+        wire_result = wire.get("result", {})
+        result["stop_reason"] = wire_result.get("stopReason", "unknown")
+        if wire_result.get("usage"):
+            result["usage"] = wire_result["usage"]
+        elif updates.get("usage"):
+            result["usage"] = updates["usage"]
+
+        thinking = "".join(updates.get("thought_parts", []))
+        if thinking:
+            if updates.get("thought_truncated") or len(thinking) > 3000:
+                result["thinking"] = thinking[:3000] + "… [truncated]"
+            else:
+                result["thinking"] = thinking
+
+        tool_calls = list(updates.get("tool_calls", {}).values())
+        if tool_calls:
+            result["tool_calls"] = tool_calls
+
+        plan_entries = updates.get("plan", [])
+        if plan_entries:
+            result["plan"] = plan_entries
+
+        if updates.get("ignored_updates"):
+            result["ignored_updates"] = updates["ignored_updates"]
+
+        if "error" in wire:
+            result["error"] = wire["error"]
+
+        return result
 
     text_parts: List[str] = []
     thought_parts: List[str] = []
