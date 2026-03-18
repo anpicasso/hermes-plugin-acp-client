@@ -129,17 +129,23 @@ class ACPClient:
         # JSON-RPC bookkeeping
         self._msg_id = 0
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()  # Protects stdin.write() from concurrent access
         self._resp_events: Dict[int, threading.Event] = {}
         self._resp_data: Dict[int, dict] = {}
+        self._resp_lock = threading.Lock()  # Protects _resp_events and _resp_data
 
         # Streaming update collectors (session_id → list of updates)
         self._update_queues: Dict[str, List[dict]] = {}
+        self._update_queues_lock = threading.Lock()  # Protects _update_queues
 
         # Terminal subprocess management
         self._terminals: Dict[str, subprocess.Popen] = {}
         self._term_bufs: Dict[str, bytearray] = {}
+        self._term_bufs_lock = threading.Lock()  # Protects _term_bufs
 
         self._reader: Optional[threading.Thread] = None
+        self._stderr_reader: Optional[threading.Thread] = None
+        self._watchdog: Optional[threading.Thread] = None
         self._alive = False
         self.agent_info: Optional[dict] = None
 
@@ -168,12 +174,20 @@ class ACPClient:
             launch_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
 
         self._alive = True  # must be set BEFORE reader starts
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+
+        # Spawn stderr reader thread to capture subprocess errors
+        self._stderr_reader = threading.Thread(target=self._stderr_loop, daemon=True)
+        self._stderr_reader.start()
+
+        # Spawn watchdog thread to detect idle process death
+        self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._watchdog.start()
 
         resp = self._request("initialize", {
             "protocolVersion": 1,
@@ -226,13 +240,15 @@ class ACPClient:
         if not self.process or not self.process.stdin:
             raise ConnectionError("ACP process not running")
         payload = json.dumps(msg, separators=(",", ":")).encode() + b"\n"
-        self.process.stdin.write(payload)
-        self.process.stdin.flush()
+        with self._write_lock:
+            self.process.stdin.write(payload)
+            self.process.stdin.flush()
 
     def _request(self, method: str, params: dict = None, timeout: int = 300) -> dict:
         mid = self._next_id()
         evt = threading.Event()
-        self._resp_events[mid] = evt
+        with self._resp_lock:
+            self._resp_events[mid] = evt
 
         msg: dict = {"jsonrpc": "2.0", "id": mid, "method": method}
         if params is not None:
@@ -240,12 +256,27 @@ class ACPClient:
 
         self._send(msg)
 
-        if not evt.wait(timeout=timeout):
-            self._resp_events.pop(mid, None)
-            raise TimeoutError(f"ACP timeout ({timeout}s) on {method}")
+        # Poll for response with process death detection
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                with self._resp_lock:
+                    self._resp_events.pop(mid, None)
+                raise TimeoutError(f"ACP timeout ({timeout}s) on {method}")
 
-        data = self._resp_data.pop(mid, {})
-        self._resp_events.pop(mid, None)
+            if evt.wait(timeout=min(2.0, remaining)):
+                break
+
+            # Check if process died during wait
+            if not self.is_alive:
+                with self._resp_lock:
+                    self._resp_events.pop(mid, None)
+                raise ConnectionError("ACP subprocess died during request")
+
+        with self._resp_lock:
+            data = self._resp_data.pop(mid, {})
+            self._resp_events.pop(mid, None)
         return data
 
     # ── Reader thread ─────────────────────────────────────────────────
@@ -256,28 +287,63 @@ class ACPClient:
                 line = self.process.stdout.readline()
                 if not line:
                     break
-                line = line.strip()
-                if not line:
-                    continue
+            except Exception as exc:
+                logger.error("ACP reader pipe error: %s", exc)
+                break
+
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
                 msg = json.loads(line)
                 self._dispatch(msg)
             except json.JSONDecodeError:
+                logger.warning("ACP reader: malformed JSON: %s", line[:100])
                 continue
             except Exception as exc:
-                logger.error("ACP reader error: %s", exc)
-                break
+                logger.error("ACP dispatch error: %s", exc)
+                continue
+
         self._alive = False
         # Wake any pending waiters so they don't hang forever
-        for evt in list(self._resp_events.values()):
-            evt.set()
+        with self._resp_lock:
+            for evt in list(self._resp_events.values()):
+                evt.set()
+
+    def _stderr_loop(self):
+        """Read and log stderr from the ACP subprocess."""
+        if not self.process or not self.process.stderr:
+            return
+        try:
+            for line in self.process.stderr:
+                if line:
+                    logger.warning("ACP subprocess stderr: %s", line.rstrip())
+        except Exception:
+            pass
+
+    def _watchdog_loop(self):
+        """Periodically poll process to detect death when idle."""
+        while self._alive:
+            time.sleep(5)
+            if not self._alive:
+                break
+            if self.process and self.process.poll() is not None:
+                logger.error("ACP subprocess died (watchdog detected)")
+                self._alive = False
+                with self._resp_lock:
+                    for evt in list(self._resp_events.values()):
+                        evt.set()
+                break
 
     def _dispatch(self, msg: dict):
         # 1) Response to our request
         if "id" in msg and ("result" in msg or "error" in msg) and "method" not in msg:
             mid = msg["id"]
-            if mid in self._resp_events:
-                self._resp_data[mid] = msg
-                self._resp_events[mid].set()
+            with self._resp_lock:
+                if mid in self._resp_events:
+                    self._resp_data[mid] = msg
+                    self._resp_events[mid].set()
             return
 
         # 2) Notification (no id)
@@ -299,8 +365,9 @@ class ACPClient:
         if method == "session/update":
             sid = params.get("sessionId", "")
             upd = params.get("update", {})
-            if sid in self._update_queues:
-                self._update_queues[sid].append(upd)
+            with self._update_queues_lock:
+                if sid in self._update_queues:
+                    self._update_queues[sid].append(upd)
 
     # ── Agent → Client requests ───────────────────────────────────────
 
@@ -405,10 +472,9 @@ class ACPClient:
 
         elif op == "output":
             tid = params.get("terminalId", "")
-            buf = self._term_bufs.get(tid, bytearray())
+            with self._term_bufs_lock:
+                buf = self._term_bufs.pop(tid, bytearray())
             out = buf.decode("utf-8", errors="replace")
-            if tid in self._term_bufs:
-                self._term_bufs[tid] = bytearray()
             self._send({"jsonrpc": "2.0", "id": mid, "result": {"output": out}})
 
         elif op == "wait_for_exit":
@@ -426,7 +492,8 @@ class ACPClient:
                 proc.kill()
                 exit_code = -1
             time.sleep(0.1)  # let reader catch final output
-            out = self._term_bufs.get(tid, bytearray()).decode("utf-8", errors="replace")
+            with self._term_bufs_lock:
+                out = self._term_bufs.pop(tid, bytearray()).decode("utf-8", errors="replace")
             self._send({
                 "jsonrpc": "2.0", "id": mid,
                 "result": {"exitCode": exit_code, "output": out},
@@ -442,7 +509,8 @@ class ACPClient:
         elif op == "release":
             tid = params.get("terminalId", "")
             self._terminals.pop(tid, None)
-            self._term_bufs.pop(tid, None)
+            with self._term_bufs_lock:
+                self._term_bufs.pop(tid, None)
             self._send({"jsonrpc": "2.0", "id": mid, "result": {}})
 
         else:
@@ -460,8 +528,9 @@ class ACPClient:
             chunk = proc.stdout.read(4096)
             if not chunk:
                 break
-            if tid in self._term_bufs:
-                self._term_bufs[tid].extend(chunk)
+            with self._term_bufs_lock:
+                if tid in self._term_bufs:
+                    self._term_bufs[tid].extend(chunk)
 
     # ── High-level API ────────────────────────────────────────────────
 
@@ -478,7 +547,8 @@ class ACPClient:
         Returns ``{"wire": <rpc response>, "updates": [<update dicts>]}``.
         On timeout, sends session/cancel and returns partial updates.
         """
-        self._update_queues[session_id] = []
+        with self._update_queues_lock:
+            self._update_queues[session_id] = []
         try:
             result = self._request("session/prompt", {
                 "sessionId": session_id,
@@ -494,13 +564,15 @@ class ACPClient:
                 })
             except Exception:
                 pass
-            updates = self._update_queues.pop(session_id, [])
+            with self._update_queues_lock:
+                updates = self._update_queues.pop(session_id, [])
             return {
                 "wire": {"result": {"stopReason": "timeout"}},
                 "updates": updates,
             }
 
-        updates = self._update_queues.pop(session_id, [])
+        with self._update_queues_lock:
+            updates = self._update_queues.pop(session_id, [])
         return {"wire": result, "updates": updates}
 
     def set_mode(self, session_id: str, mode_id: str) -> dict:
@@ -532,6 +604,7 @@ def _get_client(provider: str = None) -> ACPClient:
     if not provider:
         provider = cfg.get("default_provider", "opencode")
 
+    # Fast path: check for existing alive client
     with _clients_lock:
         existing = _clients.get(provider)
         if existing and existing.is_alive:
@@ -539,20 +612,24 @@ def _get_client(provider: str = None) -> ACPClient:
         if existing:
             existing.stop()
 
-        cmd, display = _resolve_provider(provider)
-        cwd = cfg.get("default_cwd", "~")
-        auto = cfg.get("auto_approve", True)
+    # Create and start client outside lock (start() does network I/O)
+    cmd, display = _resolve_provider(provider)
+    cwd = cfg.get("default_cwd", "~")
+    auto = cfg.get("auto_approve", True)
 
-        # Per-provider cwd override
-        providers_cfg = cfg.get("providers", {})
-        pcfg = providers_cfg.get(provider, {})
-        if pcfg.get("default_cwd"):
-            cwd = pcfg["default_cwd"]
+    # Per-provider cwd override
+    providers_cfg = cfg.get("providers", {})
+    pcfg = providers_cfg.get(provider, {})
+    if pcfg.get("default_cwd"):
+        cwd = pcfg["default_cwd"]
 
-        client = ACPClient(cmd, cwd, auto, provider_name=provider)
-        client.start()
+    client = ACPClient(cmd, cwd, auto, provider_name=provider)
+    client.start()
+
+    # Insert into dictionary under lock
+    with _clients_lock:
         _clients[provider] = client
-        return client
+    return client
 
 
 # ═══════════════════════════════════════════════════════════════════════════
